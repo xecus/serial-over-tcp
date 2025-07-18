@@ -13,6 +13,9 @@ import sys
 import signal
 import select
 import logging
+import errno
+from collections import deque
+from threading import Lock, RLock
 
 class SerialToNetworkBridge:
     def __init__(self, serial_port, serial_baudrate, network_port, 
@@ -27,8 +30,12 @@ class SerialToNetworkBridge:
         
         self.running = False
         self.clients = []
+        self.clients_lock = RLock()  # Thread-safe client list access
         self.serial_conn = None
         self.server_socket = None
+        self.max_clients = 10  # Connection limit
+        self.client_threads = []  # Track client threads
+        self.shutdown_event = threading.Event()  # Graceful shutdown
         
         # Setup logging
         logging.basicConfig(level=logging.INFO, 
@@ -83,28 +90,52 @@ class SerialToNetworkBridge:
         self.logger.info(f"Client connected from {client_address}")
         
         try:
-            # Add client to list
-            self.clients.append(client_socket)
+            # Check connection limit
+            with self.clients_lock:
+                if len(self.clients) >= self.max_clients:
+                    self.logger.warning(f"Connection limit reached ({self.max_clients}), rejecting {client_address}")
+                    client_socket.close()
+                    return
+                
+                # Add client to list
+                self.clients.append(client_socket)
             
             # Send welcome message (optional)
-            welcome_msg = f"Connected to {self.serial_port} at {self.serial_baudrate} baud\r\n"
-            client_socket.send(welcome_msg.encode())
+            try:
+                welcome_msg = f"Connected to {self.serial_port} at {self.serial_baudrate} baud\r\n"
+                client_socket.send(welcome_msg.encode())
+            except (socket.error, OSError) as e:
+                self.logger.warning(f"Failed to send welcome message to {client_address}: {e}")
+                return
             
             # Handle client data
             while self.running:
                 try:
                     # Check for data from client with timeout
-                    ready = select.select([client_socket], [], [], 0.1)
+                    ready = select.select([client_socket], [], [], 0.5)
                     if ready[0]:
-                        data = client_socket.recv(1024)
-                        if not data:
+                        try:
+                            data = client_socket.recv(1024)
+                            if not data:
+                                self.logger.debug(f"Client {client_address} disconnected (no data)")
+                                break
+                            
+                            # Validate data size
+                            if len(data) > 4096:
+                                self.logger.warning(f"Large data packet ({len(data)} bytes) from {client_address}")
+                            
+                            # Send data to serial port
+                            if self.serial_conn and self.serial_conn.is_open:
+                                try:
+                                    self.serial_conn.write(data)
+                                    self.serial_conn.flush()
+                                    self.logger.debug(f"Sent to serial: {data[:50]}{'...' if len(data) > 50 else ''}")
+                                except serial.SerialException as e:
+                                    self.logger.error(f"Serial write error: {e}")
+                                    # Could implement serial reconnection here
+                        except socket.error as e:
+                            self.logger.error(f"Socket error receiving from {client_address}: {e}")
                             break
-                        
-                        # Send data to serial port
-                        if self.serial_conn and self.serial_conn.is_open:
-                            self.serial_conn.write(data)
-                            self.serial_conn.flush()
-                            self.logger.debug(f"Sent to serial: {data}")
                         
                 except socket.timeout:
                     continue
@@ -115,38 +146,61 @@ class SerialToNetworkBridge:
         except Exception as e:
             self.logger.error(f"Error with client {client_address}: {e}")
         finally:
-            # Remove client from list
-            if client_socket in self.clients:
-                self.clients.remove(client_socket)
-            client_socket.close()
+            # Remove client from list (thread-safe)
+            with self.clients_lock:
+                if client_socket in self.clients:
+                    self.clients.remove(client_socket)
+            
+            # Close socket safely
+            try:
+                client_socket.close()
+            except Exception as e:
+                self.logger.debug(f"Error closing client socket: {e}")
+            
             self.logger.info(f"Client {client_address} disconnected")
     
     def serial_to_network_thread(self):
         """Thread function to read from serial and send to all clients"""
-        while self.running:
+        while self.running and not self.shutdown_event.is_set():
             try:
-                if self.serial_conn and self.serial_conn.is_open and self.clients:
+                if self.serial_conn and self.serial_conn.is_open:
                     # Read from serial port
                     if self.serial_conn.in_waiting > 0:
-                        data = self.serial_conn.read(self.serial_conn.in_waiting)
-                        if data:
-                            self.logger.debug(f"Received from serial: {data}")
-                            
-                            # Send to all connected clients
-                            disconnected_clients = []
-                            for client in self.clients:
-                                try:
-                                    client.send(data)
-                                except:
-                                    disconnected_clients.append(client)
-                            
-                            # Remove disconnected clients
-                            for client in disconnected_clients:
-                                if client in self.clients:
-                                    self.clients.remove(client)
-                                    client.close()
+                        try:
+                            data = self.serial_conn.read(self.serial_conn.in_waiting)
+                            if data:
+                                self.logger.debug(f"Received from serial: {data[:50]}{'...' if len(data) > 50 else ''}")
+                                
+                                # Send to all connected clients (thread-safe)
+                                disconnected_clients = []
+                                with self.clients_lock:
+                                    clients_copy = self.clients.copy()  # Work with copy to avoid lock contention
+                                
+                                for client in clients_copy:
+                                    try:
+                                        client.send(data)
+                                    except (socket.error, OSError) as e:
+                                        self.logger.debug(f"Client send failed: {e}")
+                                        disconnected_clients.append(client)
+                                    except Exception as e:
+                                        self.logger.error(f"Unexpected error sending to client: {e}")
+                                        disconnected_clients.append(client)
+                                
+                                # Remove disconnected clients (thread-safe)
+                                if disconnected_clients:
+                                    with self.clients_lock:
+                                        for client in disconnected_clients:
+                                            if client in self.clients:
+                                                self.clients.remove(client)
+                                            try:
+                                                client.close()
+                                            except Exception:
+                                                pass
+                        except serial.SerialException as e:
+                            self.logger.error(f"Serial read error: {e}")
+                            time.sleep(1)  # Wait before retry
                 
-                time.sleep(0.01)  # Small delay to prevent busy waiting
+                time.sleep(0.005)  # Reduced sleep for better responsiveness
                 
             except Exception as e:
                 self.logger.error(f"Error in serial to network thread: {e}")
@@ -163,9 +217,11 @@ class SerialToNetworkBridge:
                 # Start client handler thread
                 client_thread = threading.Thread(
                     target=self.handle_client, 
-                    args=(client_socket, client_address)
+                    args=(client_socket, client_address),
+                    name=f"Client-{client_address[0]}:{client_address[1]}"
                 )
                 client_thread.daemon = True
+                self.client_threads.append(client_thread)
                 client_thread.start()
                 
             except socket.timeout:
@@ -203,31 +259,55 @@ class SerialToNetworkBridge:
         return True
     
     def stop(self):
-        """Stop the bridge"""
+        """Stop the bridge gracefully"""
         self.logger.info("Stopping serial to network bridge...")
         
+        # Signal all threads to stop
         self.running = False
+        self.shutdown_event.set()
         
-        # Close all client connections
-        for client in self.clients:
-            client.close()
-        self.clients.clear()
-        
-        # Close server socket
+        # Close server socket first to stop accepting new connections
         if self.server_socket:
-            self.server_socket.close()
+            try:
+                self.server_socket.close()
+            except Exception as e:
+                self.logger.debug(f"Error closing server socket: {e}")
+        
+        # Close all client connections (thread-safe)
+        with self.clients_lock:
+            for client in self.clients.copy():
+                try:
+                    client.close()
+                except Exception as e:
+                    self.logger.debug(f"Error closing client socket: {e}")
+            self.clients.clear()
+        
+        # Wait for client threads to finish (with timeout)
+        for thread in self.client_threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    self.logger.warning(f"Thread {thread.name} did not stop gracefully")
         
         # Close serial connection
         if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
+            try:
+                self.serial_conn.close()
+            except Exception as e:
+                self.logger.debug(f"Error closing serial connection: {e}")
         
         self.logger.info("Bridge stopped")
 
-def signal_handler(signum, frame, bridge):
+def signal_handler(signum, frame):
     """Handle interrupt signals"""
-    print("\nReceived interrupt signal, stopping...")
-    bridge.stop()
+    global bridge_instance
+    print(f"\nReceived signal {signum}, stopping...")
+    if bridge_instance:
+        bridge_instance.stop()
     sys.exit(0)
+
+# Global variable for signal handler
+bridge_instance = None
 
 def main():
     parser = argparse.ArgumentParser(description='Serial to Network Bridge (ser2net equivalent)')
@@ -264,8 +344,10 @@ def main():
     )
     
     # Setup signal handlers
-    signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, bridge))
-    signal.signal(signal.SIGTERM, lambda s, f: signal_handler(s, f, bridge))
+    global bridge_instance
+    bridge_instance = bridge
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Start bridge
     if bridge.start():
