@@ -258,10 +258,11 @@ class SerialTCPClient:
             
             if self.connect_to_server():
                 self.logger.info("Reconnection successful")
+                self.reconnect_attempts = 0  # Reset counter on successful reconnection
                 return
-        
-        self.logger.error("Maximum reconnection attempts reached, stopping client")
-        self.running = False
+        else:
+            self.logger.error("Maximum reconnection attempts reached, stopping client")
+            self.running = False
     
     def tcp_to_virtual_thread(self):
         """Thread function to read from TCP and write to virtual device"""

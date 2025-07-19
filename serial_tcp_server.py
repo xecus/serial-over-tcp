@@ -272,6 +272,8 @@ class SerialToNetworkBridge:
                 self.server_socket.close()
             except Exception as e:
                 self.logger.debug(f"Error closing server socket: {e}")
+            finally:
+                self.server_socket = None
         
         # Close all client connections (thread-safe)
         with self.clients_lock:
@@ -295,6 +297,8 @@ class SerialToNetworkBridge:
                 self.serial_conn.close()
             except Exception as e:
                 self.logger.debug(f"Error closing serial connection: {e}")
+            finally:
+                self.serial_conn = None
         
         self.logger.info("Bridge stopped")
 

@@ -1,0 +1,14 @@
+# Serial Communication Toolkit Dependencies
+
+# Core dependencies
+pyserial>=3.4
+
+# Testing dependencies
+pytest>=6.0.0
+pytest-cov>=2.10.0
+pytest-mock>=3.6.0
+
+# Development dependencies
+flake8>=3.8.0
+black>=21.0.0
+mypy>=0.812
