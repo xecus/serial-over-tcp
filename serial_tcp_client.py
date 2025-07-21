@@ -2,6 +2,9 @@
 """
 Serial over TCP Client with Virtual Serial Device
 Creates a virtual serial port that forwards data to/from a TCP connection
+
+Copyright (c) 2025 Hiroyuki Ootaguro (Serial over TCP Toolkit)
+Licensed under the MIT License. See LICENSE file for details.
 """
 
 import socket

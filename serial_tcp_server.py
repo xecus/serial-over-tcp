@@ -2,6 +2,9 @@
 """
 ser2net equivalent Python program
 Provides telnet access to serial ports
+
+Copyright (c) 2025 Hiroyuki Ootaguro (Serial over TCP Toolkit)
+Licensed under the MIT License. See LICENSE file for details.
 """
 
 import socket

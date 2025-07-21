@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 仮想シリアルデバイスを作成し、送信された内容をエコーバックするスクリプト
+
+Copyright (c) 2025 Hiroyuki Ootaguro (Serial over TCP Toolkit)
+Licensed under the MIT License. See LICENSE file for details.
 """
 
 import os
