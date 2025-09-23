@@ -234,8 +234,16 @@ class TestSerialTCPClient(unittest.TestCase):
         self.client.running = True
         self.client.reconnect_attempts = 2
 
-        with mock.patch.object(self.client, 'connect_to_server', return_value=True) as mock_connect, \
-             mock.patch('time.sleep') as mock_sleep:
+        def mock_connect_success():
+            # Simulate successful connection by resetting counter
+            with self.client.reconnection_lock:
+                self.client.reconnect_attempts = 0
+            return True
+
+        with mock.patch.object(self.client, 'connect_to_server', side_effect=mock_connect_success) as mock_connect, \
+             mock.patch.object(self.client, '_restart_data_threads') as mock_restart, \
+             mock.patch.object(self.client, '_verify_virtual_device', return_value=True) as mock_verify, \
+             mock.patch.object(self.client.shutdown_event, 'wait', return_value=False) as mock_wait:
             self.client._handle_connection_loss()
 
             # Successful reconnection resets counter to 0
@@ -243,8 +251,10 @@ class TestSerialTCPClient(unittest.TestCase):
             # Exponential backoff: delay = 1.0 * (2 ** (3-1)) = 4.0
             # (attempts was incremented before reconnection)
             expected_delay = self.client.reconnect_delay * (2 ** (3 - 1))
-            mock_sleep.assert_called_once_with(expected_delay)
+            mock_wait.assert_called_once_with(expected_delay)
             mock_connect.assert_called_once()
+            mock_verify.assert_called_once()
+            mock_restart.assert_called_once()
 
     def test_handle_connection_loss_exceed_limit(self):
         """Test connection loss handling when exceeding retry limit"""
@@ -377,8 +387,16 @@ class TestSerialTCPClient(unittest.TestCase):
         self.client.reconnect_attempts = 2  # Start with some failed attempts
         self.client.running = True
 
-        with mock.patch('time.sleep'), \
-             mock.patch.object(self.client, 'connect_to_server', return_value=True):
+        def mock_connect_success():
+            # Simulate successful connection by resetting counter
+            with self.client.reconnection_lock:
+                self.client.reconnect_attempts = 0
+            return True
+
+        with mock.patch.object(self.client.shutdown_event, 'wait', return_value=False), \
+             mock.patch.object(self.client, 'connect_to_server', side_effect=mock_connect_success), \
+             mock.patch.object(self.client, '_verify_virtual_device', return_value=True), \
+             mock.patch.object(self.client, '_restart_data_threads'):
 
             self.client._handle_connection_loss()
 

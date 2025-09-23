@@ -19,6 +19,8 @@ import pty
 import select
 import termios
 import errno
+import fcntl
+import atexit
 from pathlib import Path
 from threading import Lock, Event
 
@@ -200,6 +202,15 @@ class SerialTCPClient:
         self.shutdown_event = Event()
         self.connection_lock = Lock()
 
+        # Thread management
+        self.tcp_thread = None
+        self.virtual_thread = None
+        self.threads_lock = Lock()
+
+        # Reconnection state management
+        self.reconnection_lock = Lock()
+        self.reconnection_in_progress = False
+
         # Setup logging
         logging.basicConfig(level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
@@ -228,7 +239,8 @@ class SerialTCPClient:
                     self.tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
                 self.tcp_socket.connect((self.server_host, self.server_port))
-                self.reconnect_attempts = 0
+                with self.reconnection_lock:
+                    self.reconnect_attempts = 0
 
                 self.logger.info(f"Connected to server {self.server_host}:{self.server_port}")
                 return True
@@ -262,19 +274,47 @@ class SerialTCPClient:
         if not self.running:
             return
 
+        # Prevent multiple concurrent reconnection attempts
+        with self.reconnection_lock:
+            if self.reconnection_in_progress:
+                self.logger.debug("Reconnection already in progress, skipping")
+                return
+
+            self.reconnection_in_progress = True
+
+        try:
+            self._do_reconnection()
+        finally:
+            with self.reconnection_lock:
+                self.reconnection_in_progress = False
+
+    def _do_reconnection(self):
+        """Perform the actual reconnection logic"""
         self.reconnect_attempts += 1
         if self.reconnect_attempts <= self.max_reconnect_attempts:
             msg = (f"Attempting to reconnect "
                    f"({self.reconnect_attempts}/{self.max_reconnect_attempts})...")
             self.logger.info(msg)
 
-            # Exponential backoff
+            # Exponential backoff with interruption support
             delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), 30)
-            time.sleep(delay)
+            if self.shutdown_event.wait(delay):
+                # Shutdown was requested during delay
+                self.logger.info("Shutdown requested during reconnection delay")
+                return
 
             if self.connect_to_server():
                 self.logger.info("Reconnection successful")
-                self.reconnect_attempts = 0  # Reset counter on successful reconnection
+                # Reset counter on successful reconnection (already done in connect_to_server)
+
+                # Verify virtual device is still valid before restarting threads
+                if not self._verify_virtual_device():
+                    self.logger.error("Virtual device is no longer valid, stopping client")
+                    self.running = False
+                    return
+
+                # Restart data transfer threads after successful reconnection
+                self._restart_data_threads()
                 return
         else:
             self.logger.error(
@@ -290,7 +330,12 @@ class SerialTCPClient:
                     continue
 
                 # Check for data from TCP connection
-                ready = select.select([self.tcp_socket], [], [], 0.5)
+                try:
+                    ready = select.select([self.tcp_socket], [], [], 0.5)
+                except (OSError, ValueError) as e:
+                    self.logger.error(f"Socket select error: {e}")
+                    self._handle_connection_loss()
+                    break
                 if ready[0]:
                     try:
                         data = self.tcp_socket.recv(4096)
@@ -344,7 +389,11 @@ class SerialTCPClient:
             try:
                 # Check for data from virtual device
                 if self.virtual_device and self.virtual_device.master_fd is not None:
-                    ready = select.select([self.virtual_device.master_fd], [], [], 0.5)
+                    try:
+                        ready = select.select([self.virtual_device.master_fd], [], [], 0.5)
+                    except (OSError, ValueError) as e:
+                        self.logger.error(f"Virtual device select error: {e}")
+                        break
                     if ready[0]:
                         try:
                             data = os.read(self.virtual_device.master_fd, 4096)
@@ -394,13 +443,14 @@ class SerialTCPClient:
         self.running = True
 
         # Start data transfer threads
-        tcp_thread = threading.Thread(target=self.tcp_to_virtual_thread)
-        tcp_thread.daemon = True
-        tcp_thread.start()
+        with self.threads_lock:
+            self.tcp_thread = threading.Thread(target=self.tcp_to_virtual_thread)
+            self.tcp_thread.daemon = True
+            self.tcp_thread.start()
 
-        virtual_thread = threading.Thread(target=self.virtual_to_tcp_thread)
-        virtual_thread.daemon = True
-        virtual_thread.start()
+            self.virtual_thread = threading.Thread(target=self.virtual_to_tcp_thread)
+            self.virtual_thread.daemon = True
+            self.virtual_thread.start()
 
         device_info = (self.virtual_device.device_path
                        or self.virtual_device.slave_name)
@@ -426,6 +476,20 @@ class SerialTCPClient:
         self.running = False
         self.shutdown_event.set()
 
+        # Wait for threads to finish gracefully
+        with self.threads_lock:
+            if self.tcp_thread and self.tcp_thread.is_alive():
+                self.logger.debug("Waiting for TCP thread to finish...")
+                self.tcp_thread.join(timeout=3.0)
+                if self.tcp_thread.is_alive():
+                    self.logger.warning("TCP thread did not finish within timeout")
+
+            if self.virtual_thread and self.virtual_thread.is_alive():
+                self.logger.debug("Waiting for virtual thread to finish...")
+                self.virtual_thread.join(timeout=3.0)
+                if self.virtual_thread.is_alive():
+                    self.logger.warning("Virtual thread did not finish within timeout")
+
         # Close TCP connection
         if self.tcp_socket:
             try:
@@ -445,6 +509,54 @@ class SerialTCPClient:
             self.virtual_device = None
 
         self.logger.info("Client stopped")
+
+    def _restart_data_threads(self):
+        """Restart data transfer threads after reconnection"""
+        self.logger.info("Restarting data transfer threads...")
+
+        with self.threads_lock:
+            # Wait for old threads to finish if they're still alive
+            if self.tcp_thread and self.tcp_thread.is_alive():
+                self.logger.debug("Waiting for TCP thread to finish...")
+                self.tcp_thread.join(timeout=2.0)
+                if self.tcp_thread.is_alive():
+                    self.logger.warning("TCP thread did not finish gracefully, continuing anyway")
+
+            if self.virtual_thread and self.virtual_thread.is_alive():
+                self.logger.debug("Waiting for virtual thread to finish...")
+                self.virtual_thread.join(timeout=2.0)
+                if self.virtual_thread.is_alive():
+                    self.logger.warning("Virtual thread did not finish gracefully, continuing anyway")
+
+            # Start new data transfer threads
+            self.tcp_thread = threading.Thread(target=self.tcp_to_virtual_thread)
+            self.tcp_thread.daemon = True
+            self.tcp_thread.start()
+
+            self.virtual_thread = threading.Thread(target=self.virtual_to_tcp_thread)
+            self.virtual_thread.daemon = True
+            self.virtual_thread.start()
+
+        self.logger.info("Data transfer threads restarted")
+
+    def _verify_virtual_device(self):
+        """Verify virtual device is still valid and accessible"""
+        if not self.virtual_device:
+            self.logger.error("Virtual device object is None")
+            return False
+
+        if self.virtual_device.master_fd is None:
+            self.logger.error("Virtual device master_fd is None")
+            return False
+
+        # Test if file descriptor is still valid
+        try:
+            # Use fcntl to check if fd is valid without side effects
+            fcntl.fcntl(self.virtual_device.master_fd, fcntl.F_GETFD)
+            return True
+        except (OSError, ValueError) as e:
+            self.logger.error(f"Virtual device file descriptor is invalid: {e}")
+            return False
 
 
 # Global variable for signal handler
@@ -481,11 +593,12 @@ def main():
         virtual_device_path=args.device
     )
 
-    # Setup signal handlers
+    # Setup signal handlers and cleanup
     global client_instance
     client_instance = client
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    atexit.register(lambda: client.stop() if client else None)
 
     # Start client
     if client.start():
