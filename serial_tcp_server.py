@@ -358,8 +358,8 @@ def main():
     parser = argparse.ArgumentParser(description='Serial to Network Bridge (ser2net equivalent)')
     parser.add_argument('serial_port', help='Serial port (e.g., /dev/ttyUSB0, COM1)')
     parser.add_argument('network_port', type=int, help='Network port to listen on')
-    parser.add_argument('-b', '--baudrate', type=int, default=9600,
-                        help='Serial baudrate (default: 9600)')
+    parser.add_argument('-b', '--baudrate', type=int, required=True,
+                        help='Serial baudrate')
     parser.add_argument('-d', '--databits', type=int, default=8, choices=[5, 6, 7, 8],
                         help='Data bits (default: 8)')
     parser.add_argument('-p', '--parity', default='N', choices=['N', 'E', 'O', 'M', 'S'],
