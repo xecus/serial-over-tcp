@@ -297,7 +297,7 @@ class SerialTCPClient:
                         if not data:
                             self.logger.warning("TCP connection closed by server")
                             self._handle_connection_loss()
-                            break
+                            continue
 
                         # Validate data size
                         if len(data) > 8192:
@@ -331,7 +331,7 @@ class SerialTCPClient:
                         else:
                             self.logger.error(f"TCP socket error: {e}")
                         self._handle_connection_loss()
-                        break
+                        continue
 
             except Exception as e:
                 if self.running:
@@ -361,7 +361,7 @@ class SerialTCPClient:
                                                 or e.errno == errno.ECONNRESET):
                                             self.logger.info("TCP connection lost while sending")
                                             self._handle_connection_loss()
-                                            break
+                                            continue
                                         else:
                                             raise
                         except OSError as e:
